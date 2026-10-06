@@ -4,7 +4,7 @@ const path = require('path');
 const chalk = require('chalk');
 const prompt = require('prompts');
 const nodeFetch = require('node-fetch');
-const fs = require('fs-extra');
+const fs = require('fs');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const FormData = require('form-data');
 const Configstore = require('configstore');
@@ -518,14 +518,11 @@ async function run(cfg) {
     const bundleFile = cfg.bundleFile || './build.zip';
 
     if (!cfg.bundleFile) {
-      if (await fs.pathExists(bundleFile)) {
-        fs.removeSync(bundleFile);
-      }
-
+      fs.rmSync(bundleFile, { recursive: true, force: true });
       await zip('./' + staticPath, bundleFile);
     }
 
-    if (!fs.pathExists(bundleFile)) {
+    if (!fs.existsSync(bundleFile)) {
       console.error('Empty bundle file: ' + bundleFile);
       return false;
     }
