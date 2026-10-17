@@ -12,6 +12,8 @@
     "vk-hosting-config.json.example",
     "fetch-request.js",
     "proxy-agent.js",
+    "readline-prompt.js",
+    "token-store.js",
     "zip.js"
   ],
   "scripts": {
@@ -49,8 +51,6 @@
   },
   "homepage": "https://github.com/VKCOM/vk-miniapps-deploy",
   "dependencies": {
-    "configstore": "^5.0.0",
-    "prompts": "^2.1.0",
     "undici": "^7.16.0",
     "yazl": "^3.3.1"
   },

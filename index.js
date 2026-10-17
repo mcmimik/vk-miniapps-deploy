@@ -1,18 +1,14 @@
-const packageJson = require('./package.json');
 const path = require('path');
 const { styleText } = require('util');
-const prompt = require('prompts');
 const fs = require('fs');
-const Configstore = require('configstore');
 const zip = require('./zip');
 const createFetch = require('./fetch-request');
 const createProxyAgent = require('./proxy-agent');
-const vault = new Configstore(packageJson.name, {});
+const { confirm, text: promptText, close: closePrompt } = require('./readline-prompt');
+const tokenStore = require('./token-store');
 
 var configJSON = require(path.resolve(process.cwd(), './vk-hosting-config.json'));
 var cfg = configJSON || {};
-prompt.message = 'vk-mini-apps-deploy'.grey;
-prompt.delimiter = '=>'.grey;
 
 const DEBUG_MODE = !!cfg.debug;
 
@@ -122,15 +118,13 @@ async function auth(app_id) {
 
     let handled = false;
     do {
-      const prompt_question = await prompt({
-        type: 'confirm',
-        name: 'result',
-        initial: true,
-        message: styleText('yellow', 'Please open this url in browser ' + code_auth_url),
-      });
+      const promptQuestion = await confirm(
+        styleText('yellow', 'Please open this url in browser ' + code_auth_url),
+        true,
+      );
 
-      if (!prompt_question.result) {
-        return Promise.reject('empty response ' + prompt_question.result);
+      if (!promptQuestion) {
+        return Promise.reject('empty response ' + promptQuestion);
       }
 
       const code_auth_token_url = `${OAUTH_HOST}code_auth_token?device_id=${device_id}&client_id=${DEPLOY_APP_ID}&mini_app_id=${app_id}`;
@@ -177,16 +171,10 @@ async function api(method, params) {
     if (errorCode === 5 && !process.env.MINI_APPS_ACCESS_TOKEN && !cfg.noprompt) {
       console.error(errorMessage);
 
-      const questions = [
-        {
-          type: 'confirm',
-          initial: true,
-          name: 'updateToken',
-          message: styleText('yellow', 'Would you like to try to retrieve a new token?'),
-        },
-      ];
-
-      const { updateToken } = await prompt(questions);
+      const updateToken = await confirm(
+        styleText('yellow', 'Would you like to try to retrieve a new token?'),
+        true,
+      );
       if (updateToken) {
         await retrieveAndSaveAccessToken(cfg);
         return api(method, params);
@@ -255,17 +243,15 @@ async function handleQueue(user_id, base_url, key, ts, version, handled, cfg) {
 
         if (event.code === CODE_CONFIRM_SENT_VIA_MESSAGE) {
           console.info(styleText('green', 'Please, confirm deploy on your phone.'));
-          const result = await prompt({
-            type: 'text',
-            name: 'code',
-            message: styleText('yellow', 'Please, enter code from Administration: '),
-          });
+          const code = await promptText(
+            styleText('yellow', 'Please, enter code from Administration:'),
+          );
 
-          if (result.code) {
+          if (code) {
             const r = await api('apps.confirmDeploy', {
               app_id: cfg.app_id,
               version: version,
-              code: result.code,
+              code: code,
             });
             if (r.error) {
               console.error('Invalid confirm code');
@@ -362,8 +348,7 @@ async function retrieveAndSaveAccessToken(cfg) {
   console.log('Try to retrieve access token...');
   const { access_token, expires_in } = await auth(cfg.app_id);
   cfg.access_token = access_token;
-  vault.set('access_token', access_token);
-  vault.set('expires_in', expires_in);
+  tokenStore.save({ access_token, expires_in });
   console.log(styleText('cyan', 'Token is saved in config store!'));
   console.log(
     styleText(
@@ -408,9 +393,10 @@ async function run(cfg) {
       cfg.access_token = process.env.MINI_APPS_ACCESS_TOKEN;
     }
 
-    if (!cfg.access_token && vault.get('access_token')) {
-      cfg.access_token = vault.get('access_token');
-      cfg.expires_in = vault.get('expires_in') || 0;
+    const storedToken = cfg.access_token ? {} : tokenStore.read();
+    if (storedToken.access_token) {
+      cfg.access_token = storedToken.access_token;
+      cfg.expires_in = storedToken.expires_in || 0;
     }
 
     if (!cfg.access_token || (cfg.expires_in > 0 && cfg.expires_in * 1000 < Date.now())) {
@@ -487,7 +473,10 @@ async function run(cfg) {
 
     if (taskData.version) {
       console.log('Uploaded version ' + taskData.version + '!');
-      return getQueue(taskData.version, cfg).finally(closeProxyAgent);
+      return getQueue(taskData.version, cfg).finally(() => {
+        closePrompt();
+        return closeProxyAgent();
+      });
     } else {
       console.error('Upload error: missing task version', taskData);
       process.exit(1);
