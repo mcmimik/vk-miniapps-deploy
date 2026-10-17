@@ -1,14 +1,12 @@
-const crypto = require('crypto');
 const packageJson = require('./package.json');
 const path = require('path');
-const chalk = require('chalk');
+const { styleText } = require('util');
 const prompt = require('prompts');
-const nodeFetch = require('node-fetch');
 const fs = require('fs');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const FormData = require('form-data');
 const Configstore = require('configstore');
 const zip = require('./zip');
+const createFetch = require('./fetch-request');
+const createProxyAgent = require('./proxy-agent');
 const vault = new Configstore(packageJson.name, {});
 
 var configJSON = require(path.resolve(process.cwd(), './vk-hosting-config.json'));
@@ -67,85 +65,36 @@ const URL_NAMES_MAP = {
   [URL_NAMES.MOBILE_WEB]: PLATFORMS.MOBILE_WEB,
 };
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let proxyAgent;
+let proxyFetch;
+let proxyFormData;
 
-function getTraceId() {
-  return crypto.randomBytes(4).toString('hex');
-}
-
-function getProxyAgent() {
+function getRequestClient() {
   const proxy = cfg.proxy_url || process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
-  return proxy ? new HttpsProxyAgent(proxy) : undefined;
+  if (!proxy) {
+    return { fetch: globalThis.fetch, FormData: globalThis.FormData };
+  }
+
+  if (!proxyAgent) {
+    const undici = require('undici');
+    proxyAgent = createProxyAgent(proxy, undici.ProxyAgent);
+    proxyFetch = undici.fetch;
+    proxyFormData = undici.FormData;
+  }
+
+  return { fetch: proxyFetch, FormData: proxyFormData, dispatcher: proxyAgent };
 }
 
-/**
- * @param {nodeFetch.RequestInfo} url
- * @param {nodeFetch.RequestInit} options
- * @param {number} retries
- * @param {number} backoff
- * @returns {Promise<nodeFetch.Response>}
- */
-async function fetch(url, options, retries = 3, backoff = 1000) {
-  const fetchOptions = { ...options, agent: getProxyAgent() || options?.agent };
+const fetch = createFetch(getRequestClient, DEBUG_MODE);
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      if (DEBUG_MODE) {
-        const traceId = chalk.hex(`#${((Math.random() * 0xffffff) << 0).toString(16)}`)(
-          getTraceId(),
-        );
-        const logLine = (line, type) => console.log(`[${traceId}][${type}]`, chalk.cyan(line));
-
-        logLine(url, 'REQ');
-        options && logLine(JSON.stringify(fetchOptions), 'REQ');
-
-        const response = await nodeFetch(url, fetchOptions);
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        const body = await response.clone().text();
-
-        if (body.trim().startsWith('<!DOCTYPE') || body.trim().startsWith('<html')) {
-          throw new Error('Server returned HTML page instead of expected response');
-        }
-
-        logLine(`${response.status} ${response.statusText}`, 'RESP');
-        logLine(body, 'RESP');
-
-        return response;
-      }
-
-      const response = await nodeFetch(url, fetchOptions);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const clonedResponse = response.clone();
-      const bodyText = await clonedResponse.text();
-      if (bodyText.trim().startsWith('<!DOCTYPE') || bodyText.trim().startsWith('<html')) {
-        throw new Error('Server returned HTML page instead of expected response');
-      }
-
-      return response;
-    } catch (e) {
-      if (attempt < retries) {
-        console.warn(
-          chalk.yellow(
-            `[RETRY ${attempt}/${retries - 1}] Request failed (${
-              e.message
-            }). Retrying in ${backoff}ms...`,
-          ),
-        );
-        await delay(backoff);
-      } else {
-        console.error(chalk.red(`[FETCH FAILED] Request failed after ${retries} attempts.`));
-        throw e;
-      }
-    }
+function closeProxyAgent() {
+  if (!proxyAgent) {
+    return;
   }
+
+  const agent = proxyAgent;
+  proxyAgent = undefined;
+  return agent.close();
 }
 
 /**
@@ -177,7 +126,7 @@ async function auth(app_id) {
         type: 'confirm',
         name: 'result',
         initial: true,
-        message: chalk.yellow('Please open this url in browser', code_auth_url),
+        message: styleText('yellow', 'Please open this url in browser ' + code_auth_url),
       });
 
       if (!prompt_question.result) {
@@ -224,7 +173,7 @@ async function api(method, params) {
   const res = await query.json();
   if (res.error !== void 0) {
     const errorCode = res.error.error_code;
-    const errorMessage = chalk.red(errorCode + ': ' + res.error.error_msg);
+    const errorMessage = styleText('red', errorCode + ': ' + res.error.error_msg);
     if (errorCode === 5 && !process.env.MINI_APPS_ACCESS_TOKEN && !cfg.noprompt) {
       console.error(errorMessage);
 
@@ -233,7 +182,7 @@ async function api(method, params) {
           type: 'confirm',
           initial: true,
           name: 'updateToken',
-          message: chalk.yellow('Would you like to try to retrieve a new token?'),
+          message: styleText('yellow', 'Would you like to try to retrieve a new token?'),
         },
       ];
 
@@ -255,13 +204,11 @@ async function api(method, params) {
 }
 
 async function upload(uploadUrl, bundleFile) {
+  const { FormData } = getRequestClient();
   const formData = new FormData();
-  formData.append('file', fs.createReadStream(bundleFile), { contentType: 'application/zip' });
-  const upload = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: formData.getHeaders(),
-    body: formData,
-  });
+  const blob = await fs.openAsBlob(bundleFile, { type: 'application/zip' });
+  formData.append('file', blob, path.basename(bundleFile));
+  const upload = await fetch(uploadUrl, { method: 'POST', body: formData });
   return await upload.json();
 }
 
@@ -290,26 +237,28 @@ async function handleQueue(user_id, base_url, key, ts, version, handled, cfg) {
         const message = event.message || '';
 
         if (event.code === ERROR_TEST_GROUP_UPDATE) {
-          console.error(chalk.red('Test group url update error'));
+          console.error(styleText('red', 'Test group url update error'));
           continue;
         }
 
-        console.error(chalk.red('Deploy failed, error code: #' + event.code + ' ' + message));
+        console.error(
+          styleText('red', 'Deploy failed, error code: #' + event.code + ' ' + message),
+        );
         return false;
       }
 
       if (event.type === TYPE_SUCCESS) {
         if (event.code === CODE_SUCCESS) {
-          console.info(chalk.green('Deploy success...'));
+          console.info(styleText('green', 'Deploy success...'));
           continue;
         }
 
         if (event.code === CODE_CONFIRM_SENT_VIA_MESSAGE) {
-          console.info(chalk.green('Please, confirm deploy on your phone.'));
+          console.info(styleText('green', 'Please, confirm deploy on your phone.'));
           const result = await prompt({
             type: 'text',
             name: 'code',
-            message: chalk.yellow('Please, enter code from Administration: '),
+            message: styleText('yellow', 'Please, enter code from Administration: '),
           });
 
           if (result.code) {
@@ -326,12 +275,12 @@ async function handleQueue(user_id, base_url, key, ts, version, handled, cfg) {
         }
 
         if (event.code === CODE_PUSH_SENT_VIA_PUSH) {
-          console.info(chalk.green('Please, confirm deploy on your phone.'));
+          console.info(styleText('green', 'Please, confirm deploy on your phone.'));
           continue;
         }
 
         if (event.code === CODE_PUSH_APPROVED) {
-          console.info(chalk.green('Deploy confirmed successfully.'));
+          console.info(styleText('green', 'Deploy confirmed successfully.'));
           continue;
         }
 
@@ -353,12 +302,12 @@ async function handleQueue(user_id, base_url, key, ts, version, handled, cfg) {
             const urls = event.message.urls;
             if (event.message.is_production && !handled.production) {
               handled.production = true;
-              console.info(chalk.green('URLs changed for production:'));
+              console.info(styleText('green', 'URLs changed for production:'));
             }
 
             if (!event.message.is_production && !handled.dev) {
               handled.dev = true;
-              console.info(chalk.green('URLs changed for dev:'));
+              console.info(styleText('green', 'URLs changed for dev:'));
             }
 
             let urlKeys = Object.keys(urls);
@@ -387,7 +336,9 @@ async function handleQueue(user_id, base_url, key, ts, version, handled, cfg) {
 
         if (event.code === CODE_UPDATE_TEST_GROUP_URL) {
           if (event.message && event.message.url) {
-            console.info(chalk.green('URL changed for test group "' + cfg.test_group_name + '":'));
+            console.info(
+              styleText('green', 'URL changed for test group "' + cfg.test_group_name + '":'),
+            );
             console.info(event.message.url);
           }
         }
@@ -413,9 +364,10 @@ async function retrieveAndSaveAccessToken(cfg) {
   cfg.access_token = access_token;
   vault.set('access_token', access_token);
   vault.set('expires_in', expires_in);
-  console.log(chalk.cyan('Token is saved in config store!'));
+  console.log(styleText('cyan', 'Token is saved in config store!'));
   console.log(
-    chalk.cyan(
+    styleText(
+      'cyan',
       '\nFor your CI, you can use \n > $ env MINI_APPS_ACCESS_TOKEN=' +
         access_token +
         ' yarn deploy',
@@ -535,13 +487,13 @@ async function run(cfg) {
 
     if (taskData.version) {
       console.log('Uploaded version ' + taskData.version + '!');
-      return getQueue(taskData.version, cfg);
+      return getQueue(taskData.version, cfg).finally(closeProxyAgent);
     } else {
       console.error('Upload error: missing task version', taskData);
       process.exit(1);
     }
   } catch (e) {
-    console.error(chalk.red(e));
+    console.error(styleText('red', String(e)));
     process.exit(1);
   }
 }

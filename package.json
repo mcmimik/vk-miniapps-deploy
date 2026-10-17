@@ -10,6 +10,8 @@
     "README.md",
     "index.js",
     "vk-hosting-config.json.example",
+    "fetch-request.js",
+    "proxy-agent.js",
     "zip.js"
   ],
   "scripts": {
@@ -23,7 +25,7 @@
   },
   "license": "MIT",
   "engines": {
-    "node": ">=14.14"
+    "node": ">=22.17"
   },
   "author": {
     "name": "VK",
@@ -47,12 +49,9 @@
   },
   "homepage": "https://github.com/VKCOM/vk-miniapps-deploy",
   "dependencies": {
-    "chalk": "^3.0.0",
     "configstore": "^5.0.0",
-    "form-data": "^3.0.0",
-    "https-proxy-agent": "^7.0.6",
-    "node-fetch": "^2.6.0",
     "prompts": "^2.1.0",
+    "undici": "^7.16.0",
     "yazl": "^3.3.1"
   },
   "devDependencies": {
